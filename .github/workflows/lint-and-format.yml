@@ -1,0 +1,120 @@
+name: Lint and Format
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  pull_request:
+    branches:
+      - main
+      - staging
+
+jobs:
+  lint-and-format:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          echo "Running ESLint..."
+          npm run lint 2>&1 | tee eslint-output.txt
+          ESLINT_EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $ESLINT_EXIT_CODE -ne 0 ]; then
+            echo "❌ ESLint found issues!"
+            echo "eslint_failed=true" >> $GITHUB_OUTPUT
+            echo "## ❌ ESLint Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "ESLint found issues in your code. Please fix them before merging." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### How to fix:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "npm run lint:fix" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Issues found:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat eslint-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ ESLint passed!"
+            echo "eslint_failed=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: false
+
+      - name: Run Prettier Check
+        id: prettier
+        run: |
+          echo "Running Prettier check..."
+          npm run format:check 2>&1 | tee prettier-output.txt
+          PRETTIER_EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $PRETTIER_EXIT_CODE -ne 0 ]; then
+            echo "❌ Prettier found formatting issues!"
+            echo "prettier_failed=true" >> $GITHUB_OUTPUT
+            echo "## ❌ Prettier Check Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Prettier found formatting issues in your code. Please format your code before merging." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### How to fix:" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "npm run format" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Files with formatting issues:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat prettier-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ Prettier check passed!"
+            echo "prettier_failed=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: false
+
+      - name: Create annotations for ESLint issues
+        if: failure() && steps.eslint.outputs.eslint_failed == 'true'
+        run: |
+          echo "::error title=ESLint Failed::ESLint found issues. Run 'npm run lint:fix' to automatically fix them."
+
+      - name: Create annotations for Prettier issues
+        if: failure() && steps.prettier.outputs.prettier_failed == 'true'
+        run: |
+          echo "::error title=Prettier Check Failed::Code formatting issues detected. Run 'npm run format' to format your code."
+
+      - name: Summary - All checks passed
+        if: success()
+        run: |
+          echo "## ✅ All Code Quality Checks Passed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ ESLint: No issues found" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Prettier: Code is properly formatted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your code meets all quality standards! 🎉" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: |
+            eslint-output.txt
+            prettier-output.txt
+          retention-days: 7
+          if-no-files-found: ignore

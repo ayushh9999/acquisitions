@@ -1,0 +1,221 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  pull_request:
+    branches:
+      - main
+      - staging
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_ENV: test
+      NODE_OPTIONS: --experimental-vm-modules
+      DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+      JWT_SECRET: test_jwt_secret_for_ci_cd_pipeline_testing_only
+      ARCJET_KEY: test_arcjet_key
+      PORT: 5000
+      LOG_LEVEL: error
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for PostgreSQL
+        run: |
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if pg_isready -h localhost -p 5432 -U test_user; then
+              echo "PostgreSQL is ready!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run database migrations
+        run: |
+          echo "Running database migrations..."
+          npm run db:migrate || echo "⚠️ Migrations skipped (may not be needed for tests)"
+        continue-on-error: true
+
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          echo "Running tests..."
+          npm test -- --coverage --verbose 2>&1 | tee test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "❌ Tests failed!"
+            echo "tests_failed=true" >> $GITHUB_OUTPUT
+            echo "## ❌ Tests Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Some tests did not pass. Please fix the failing tests before merging." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Test Output:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 100 test-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All tests passed!"
+            echo "tests_failed=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: false
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "## 📊 Test Coverage Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Parse coverage data
+            STATEMENTS=$(cat coverage/coverage-summary.json | jq -r '.total.statements.pct')
+            BRANCHES=$(cat coverage/coverage-summary.json | jq -r '.total.branches.pct')
+            FUNCTIONS=$(cat coverage/coverage-summary.json | jq -r '.total.functions.pct')
+            LINES=$(cat coverage/coverage-summary.json | jq -r '.total.lines.pct')
+            
+            echo "| Metric | Coverage |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Statements | ${STATEMENTS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Branches | ${BRANCHES}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Functions | ${FUNCTIONS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Lines | ${LINES}% |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Add status badge
+            if (( $(echo "$LINES >= 80" | bc -l) )); then
+              echo "✅ Coverage is above 80% threshold!" >> $GITHUB_STEP_SUMMARY
+            elif (( $(echo "$LINES >= 60" | bc -l) )); then
+              echo "⚠️ Coverage is between 60-80%. Consider adding more tests." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Coverage is below 60%. Please add more tests." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "## 📊 Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.tests.outputs.tests_failed }}" == "true" ]; then
+              echo "❌ Tests failed. See details above." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ All tests passed successfully!" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.txt
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Create annotations for test failures
+        if: failure() && steps.tests.outputs.tests_failed == 'true'
+        run: |
+          echo "::error title=Tests Failed::Some tests did not pass. Please check the test output and fix the failing tests."
+
+          # Try to extract and annotate specific test failures
+          if [ -f test-output.txt ]; then
+            while IFS= read -r line; do
+              if [[ $line == *"FAIL"* ]]; then
+                echo "::error::$line"
+              fi
+            done < test-output.txt
+          fi
+
+      - name: Comment PR with test results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let comment = '## 🧪 Test Results\n\n';
+
+            if ('${{ steps.tests.outputs.tests_failed }}' === 'true') {
+              comment += '❌ **Tests Failed**\n\n';
+              comment += 'Some tests did not pass. Please review the test output and fix the issues.\n\n';
+            } else {
+              comment += '✅ **All Tests Passed**\n\n';
+            }
+
+            // Add coverage if available
+            try {
+              const coverage = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
+              const lines = coverage.total.lines.pct;
+              const statements = coverage.total.statements.pct;
+              const branches = coverage.total.branches.pct;
+              const functions = coverage.total.functions.pct;
+              
+              comment += '### Coverage\n\n';
+              comment += '| Metric | Coverage |\n';
+              comment += '|--------|----------|\n';
+              comment += `| Statements | ${statements}% |\n`;
+              comment += `| Branches | ${branches}% |\n`;
+              comment += `| Functions | ${functions}% |\n`;
+              comment += `| Lines | ${lines}% |\n`;
+            } catch (error) {
+              comment += '_Coverage data not available_\n';
+            }
+
+            comment += `\n[View full test results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Summary - All tests passed
+        if: success()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 **All tests passed successfully!**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your code is working as expected and ready to be merged." >> $GITHUB_STEP_SUMMARY
